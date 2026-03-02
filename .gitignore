@@ -6,3 +6,8 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# Runtime state — generated at runtime, not part of source
+.alfred.pid
+.reminder_state.json
+memory.db
