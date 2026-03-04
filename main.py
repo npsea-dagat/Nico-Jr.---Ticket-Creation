@@ -13,10 +13,12 @@ Flow:
 
 import os
 import re
+import sys
 import json
 import base64
 import signal
 import atexit
+import asyncio
 import sqlite3
 from datetime import datetime, timezone, timedelta
 
@@ -96,13 +98,72 @@ REMINDER_TERMINAL_STATUSES: dict[str, set] = {
 PRIORITY_ORDER  = ["Highest", "High", "Medium", "Low", "Lowest"]
 PRIORITY_EMOJI  = {"Highest": "🔴", "High": "🟠", "Medium": "🟡", "Low": "🔵", "Lowest": "⚪"}
 
+# ── Ticket title prefix configuration ─────────────────────────────────────────
+
+# Maps a substring of the Epic summary to its short label (case-insensitive).
+# Add an entry for each epic. The first matching keyword wins.
+# Example: "Mobile App Redesign" → if "Mobile" is a key, it uses that label.
+EPIC_ABBREVIATIONS: dict[str, str] = {
+    # "Mobile": "MA",
+    # "Backend": "BE",
+    # "Android": "ANDR",
+}
+
+# Maps Jira display names to their team tag, prepended to ticket titles.
+ASSIGNEE_TAGS: dict[str, str] = {
+    "Charl Lance Cua":        "[BE3]",
+    "Benjamin Perez":         "[BEx]",
+    "Michael Gian Tiqui":     "[FE2]",
+    "Francis Mario Calvadores": "[BE2]",
+    "Davidson Ramos":         "[BE1]",
+    "Rey Robert Castro":      "[AD2]",
+    "Reniel Don Galerio":     "[IO2]",
+    "Rolando Maming":         "[AD1]",
+    "Milky Joy Agora":        "[IO1]",
+    "Jasper Caparas":         "[UI]",
+    "John Allen De Chavez":   "[FE1]",
+}
+
+
+def build_title_prefix(epic_key: str | None, assignee_name: str | None, epics: list) -> str:
+    """
+    Return the prefix string to prepend to a ticket title, e.g. "[MA][BE3] ".
+    Includes the epic abbreviation (if found) followed by the assignee tag (if found).
+    Returns an empty string if neither is found.
+    """
+    parts = []
+
+    # Epic abbreviation — look up the epic's summary and match against EPIC_ABBREVIATIONS
+    if epic_key and EPIC_ABBREVIATIONS:
+        for epic in epics:
+            if epic["key"] == epic_key:
+                summary_lower = epic["summary"].lower()
+                for keyword, abbrev in EPIC_ABBREVIATIONS.items():
+                    if keyword.lower() in summary_lower:
+                        parts.append(f"[{abbrev}]")
+                        break
+                break
+
+    # Assignee tag — case-insensitive substring match on display name
+    if assignee_name:
+        name_lower = assignee_name.lower()
+        for full_name, tag in ASSIGNEE_TAGS.items():
+            if full_name.lower() in name_lower or name_lower in full_name.lower():
+                parts.append(tag)
+                break
+
+    return "".join(parts) + (" " if parts else "")
+
 # Tracks when each ticket was last reminded — persisted so bot restarts don't
 # cause duplicate pings.
-REMINDER_STATE_FILE = os.path.join(os.path.dirname(__file__), ".reminder_state.json")
+_DATA_DIR = os.getenv("DATA_DIR", os.path.dirname(__file__))
+os.makedirs(_DATA_DIR, exist_ok=True)
+
+REMINDER_STATE_FILE = os.path.join(_DATA_DIR, ".reminder_state.json")
 
 # ── Persistent memory database ─────────────────────────────────────────────────
 
-MEMORY_DB   = os.path.join(os.path.dirname(__file__), "memory.db")
+MEMORY_DB   = os.path.join(_DATA_DIR, "memory.db")
 MAX_MESSAGES = 10_000   # prune oldest records beyond this cap
 
 
@@ -172,8 +233,33 @@ def get_cross_channel_history(limit: int = 40, exclude_channel_id: int | None = 
 
 # ── Set up API clients ─────────────────────────────────────────────────────────
 
-# Anthropic client — used to call Claude
-claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+# Anthropic async client — must be async to avoid blocking the Discord event loop
+claude_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+
+async def _call_claude(make_request, max_retries: int = 3):
+    """
+    Call the Claude API with exponential backoff on transient errors.
+
+    Retries on: rate limits, network errors, timeouts, and 5xx server errors.
+    Raises immediately on: auth errors, bad requests, and other non-retryable failures.
+    """
+    for attempt in range(max_retries):
+        try:
+            return await make_request()
+        except (anthropic.RateLimitError, anthropic.APIConnectionError, anthropic.APITimeoutError) as e:
+            if attempt == max_retries - 1:
+                raise
+            wait = 2 ** attempt  # 1s → 2s → 4s
+            print(f"[Nico Jr.] Claude transient error ({type(e).__name__}), retrying in {wait}s… (attempt {attempt + 1}/{max_retries})")
+            await asyncio.sleep(wait)
+        except anthropic.APIStatusError as e:
+            if e.status_code >= 500 and attempt < max_retries - 1:
+                wait = 2 ** attempt
+                print(f"[Nico Jr.] Claude server error {e.status_code}, retrying in {wait}s… (attempt {attempt + 1}/{max_retries})")
+                await asyncio.sleep(wait)
+            else:
+                raise
 
 # Jira uses HTTP Basic Auth: base64-encoded "email:api_token"
 _jira_auth = base64.b64encode(f"{JIRA_EMAIL}:{JIRA_API_TOKEN}".encode()).decode()
@@ -182,6 +268,22 @@ JIRA_HEADERS = {
     "Content-Type": "application/json",
     "Accept": "application/json",
 }
+
+# ── Jira response cache (5-minute TTL) ────────────────────────────────────────
+# Avoids hammering Jira on every message; cache is refreshed automatically.
+_jira_cache: dict[str, tuple[datetime, list]] = {}
+JIRA_CACHE_TTL = timedelta(minutes=5)
+
+
+def _cached_jira(key: str, fetcher) -> list:
+    entry = _jira_cache.get(key)
+    if entry:
+        fetched_at, data = entry
+        if datetime.now(timezone.utc) - fetched_at < JIRA_CACHE_TTL:
+            return data
+    data = fetcher()
+    _jira_cache[key] = (datetime.now(timezone.utc), data)
+    return data
 
 # ── Jira: Fetch all Epics in the project ──────────────────────────────────────
 
@@ -315,7 +417,7 @@ def get_jira_assignees() -> list:
 
 # ── Claude: Understand the message ────────────────────────────────────────────
 
-def analyze_message(message_text: str, epics: list, attachments: list, history: list, assignees: list, parents: list, server_history: list) -> dict:
+async def analyze_message(message_text: str, epics: list, attachments: list, history: list, assignees: list, parents: list, server_history: list, quoted_text: str = "", drive_count: int = 0) -> dict:
     """
     Ask Claude what the user wants to do. Returns one of three shapes:
 
@@ -397,11 +499,16 @@ Recent conversations across other channels (server memory — use for broader co
 
     # Tell Claude about attachments so it can reference them naturally,
     # but don't expose the URLs — the files will be uploaded directly to Jira.
+    attachment_parts = []
     if attachments:
+        attachment_parts.append(f"{len(attachments)} Discord file(s) (screenshot(s) / recording(s))")
+    if drive_count:
+        attachment_parts.append(f"{drive_count} Google Drive file(s)")
+    if attachment_parts:
         attachments_section = (
-            f"\nThe user attached {len(attachments)} file(s) (screenshot(s) / recording(s)). "
-            f"These will be uploaded directly to the Jira ticket as attachments. "
-            f"Reference them naturally in the description (e.g. 'See attached screenshot') "
+            f"\nThe user provided the following attachments: {', '.join(attachment_parts)}. "
+            f"These will be uploaded directly to the Jira ticket. "
+            f"Reference them naturally in the description (e.g. 'See attached screenshot', 'See attached Drive file') "
             f"but do NOT include any URLs.\n"
         )
     else:
@@ -420,27 +527,80 @@ Recent conversations across other channels (server memory — use for broader co
     else:
         intent_hint = ""
 
+    if quoted_text:
+        quoted_section = f"""
+━━━ FORWARDED / QUOTED CONTENT ━━━
+You have FULL ACCESS to this content — it was extracted directly from the forwarded or quoted message.
+Do NOT say you cannot read it. Read it and act on it.
+If the current message below is empty, the user forwarded this content with no extra instruction —
+decide what action to take based on the forwarded content alone (e.g. if it describes a bug or task, you may offer to CREATE a ticket via CHAT, but never auto-create without an explicit instruction).
+
+{quoted_text}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+    else:
+        quoted_section = ""
+
     prompt = f"""You are Nico Jr., a team assistant embedded in a Discord server. You manage Jira tickets and chat with the team. You can see all messages — not just ones that tag you.
-{intent_hint}
-Message from {message_text.split(':')[0] if ':' in message_text else 'someone'}:
+{intent_hint}{quoted_section}
+━━━ CURRENT MESSAGE (the ONLY message you are deciding on) ━━━
 \"\"\"{message_text}\"\"\"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {history_section}{server_history_section}{assignees_section}{epics_section}{parents_section}{attachments_section}
-Decide which of these four actions to take:
+Decide which of these five actions to take:
 
-1. CREATE  — someone is explicitly asking to file / log / create a ticket, or attaches a screenshot of a bug and clearly wants it tracked.
-2. UPDATE  — the message references an existing ticket key (e.g. PROJ-123) and asks to change something.
-3. CHAT    — the message is directed at you, asks you a question, or you can add clear value (e.g. someone asks about team members, epics, or needs help you can provide).
-4. IGNORE  — the conversation is between other people and doesn't involve or need you; chiming in would be intrusive or unhelpful.
+1. CREATE  — the CURRENT MESSAGE itself explicitly asks to file / log / create a new ticket.
+2. UPDATE  — the CURRENT MESSAGE references an existing ticket key (e.g. PROJ-123) and asks to change something.
+3. CHAT    — the CURRENT MESSAGE is directed at you, asks you a question, or you can add clear value.
+4. TIMER   — the CURRENT MESSAGE asks to set a timer or be pinged after a duration (e.g. "set a timer for 5 minutes", "remind me in 30 seconds", "ping me in 2 hours").
+5. IGNORE  — anything else.
 
-Rules:
-- NEVER create a ticket unless someone explicitly asks (words like "file", "log", "create", "open", "add a ticket", "pafile", "i-ticket", etc.).
-- If a ticket key is present in the message it is ALWAYS an update, never a create.
-- Default to IGNORE when in doubt — it is better to stay quiet than to interrupt.
-- Only CHAT when the message is clearly addressed to you or when you have something genuinely useful to add.
+━━━ STRICT RULES FOR UPDATE ━━━
+- You may ONLY choose UPDATE if the CURRENT MESSAGE itself contains an explicit ticket key (e.g. TA-6793).
+- NEVER infer or guess the ticket key from conversation history, server memory, or prior messages.
+- If the user wants to change a ticket but has not written the key in the CURRENT MESSAGE, choose CHAT and ask them which ticket they mean.
+
+━━━ STRICT RULES FOR CREATE ━━━
+- You may ONLY choose CREATE if the CURRENT MESSAGE contains an explicit filing instruction.
+  Accepted trigger phrases (in any language): "file", "log", "create", "open a ticket",
+  "add a ticket", "pafile", "i-ticket", "gawa ng ticket", "ticket mo", "i-log", "ilagay sa jira",
+  "report this", or a clear equivalent.
+- Conversation history, server memory, or prior messages DO NOT trigger CREATE — ever.
+  If a filing instruction appeared in a previous message, it was already handled. Ignore it.
+- Reactions, short replies, or follow-up chatter after a ticket was created ("waw", "ok",
+  "thanks", "attentive", "nice", single words/emoji) are NEVER create — choose IGNORE.
+- When in doubt between CREATE and anything else, choose IGNORE.
+
+━━━ STRICT RULES FOR TIMER ━━━
+- Choose TIMER only when the CURRENT MESSAGE explicitly requests a countdown timer or a timed ping.
+- Extract the exact duration in seconds (e.g. "5 minutes" → 300, "1 hour 30 minutes" → 5400, "90 seconds" → 90).
+- Extract an optional short label describing what the timer is for (e.g. "lunch", "standup", "break").
+
+━━━ STRICT RULES FOR CHAT ━━━
+- Only respond if the CURRENT MESSAGE is clearly addressed to you or asks something you can answer.
+- Default to IGNORE when unsure.
+
+━━━ GENERAL RULES ━━━
+- If a ticket key is in the CURRENT MESSAGE → always UPDATE, never CREATE.
 - Default priority → "Medium". Default issue_type → "Task".
-- Use "Bug" for broken things, "Story" for new features, "Epic" for large bodies of work, "Task" for everything else.
-- Set parent_key only when explicitly requested or obviously a sub-task.
-- For updates, only include fields the user actually mentions.
+- Use "Bug" for broken things, "Story" for features, "Epic" for large initiatives, "Task" otherwise.
+- Set parent_key only when explicitly requested.
+- For updates, include only fields the current message mentions.
+
+━━━ REACTION RULES ━━━
+Every response may include an optional "reaction" field — a single Unicode emoji to react to the message with.
+React naturally, like a coworker would. Examples:
+  😂 or 🤣 — genuinely funny joke or meme
+  😢 — something sad or unfortunate
+  😠 — something annoying or offensive
+  👍 — agreement, good idea, or approval
+  ❤️ — something wholesome or appreciated
+  🎉 — good news, celebration, achievement
+  😮 — surprising or unexpected
+  🤔 — interesting or thought-provoking
+  👀 — something worth watching or suspicious
+  ✅ — confirmed, done, understood
+Only react when it genuinely fits — don't react to every message. Use null if nothing feels right.
 
 --- If CREATE ---
 Reply with ONLY:
@@ -452,7 +612,8 @@ Reply with ONLY:
   "assignee": "name or email, or null",
   "issue_type": "Bug | Task | Story | Epic",
   "epic_key": "matching Epic key or null",
-  "parent_key": "parent ticket key or null"
+  "parent_key": "parent ticket key or null",
+  "reaction": "single emoji or null"
 }}
 
 --- If UPDATE ---
@@ -468,37 +629,51 @@ Reply with ONLY:
     "issue_type": "new type if mentioned",
     "epic_key": "new epic key if mentioned",
     "parent_key": "new parent key if mentioned"
-  }}
+  }},
+  "reaction": "single emoji or null"
+}}
+
+--- If TIMER ---
+Reply with ONLY:
+{{
+  "action": "timer",
+  "duration_seconds": 300,
+  "label": "short label or null",
+  "reaction": "single emoji or null"
 }}
 
 --- If CHAT ---
 Reply with ONLY:
 {{
-  "action": "chat"
+  "action": "chat",
+  "reaction": "single emoji or null"
 }}
 
 --- If IGNORE ---
 Reply with ONLY:
 {{
-  "action": "ignore"
+  "action": "ignore",
+  "reaction": "single emoji or null"
 }}
 
 Respond with JSON only — no explanation, no markdown fences."""
 
-    response = claude_client.messages.create(
+    response = await _call_claude(lambda: claude_client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=800,
         messages=[{"role": "user", "content": prompt}],
-    )
+    ))
 
-    # Claude returns a text block — parse it as JSON
+    # Strip any accidental markdown fences before parsing
     raw = response.content[0].text.strip()
+    raw = re.sub(r'^```(?:json)?\s*', '', raw)
+    raw = re.sub(r'\s*```$', '', raw).strip()
     return json.loads(raw)
 
 
 # ── Claude: Conversational reply ──────────────────────────────────────────────
 
-def chat_with_nico_jr(message_text: str, author_name: str, history: list, epics: list, assignees: list, parents: list, server_history: list) -> str:
+async def chat_with_nico_jr(message_text: str, author_name: str, history: list, epics: list, assignees: list, parents: list, server_history: list, quoted_text: str = "") -> str:
     """
     Generate a conversational reply from Nico Jr. when the user isn't asking
     to create or update a ticket. Nico Jr. responds like a helpful, friendly
@@ -551,6 +726,17 @@ def chat_with_nico_jr(message_text: str, author_name: str, history: list, epics:
     else:
         server_history_context = ""
 
+    if quoted_text:
+        quoted_block = f"""
+━━━ FORWARDED / QUOTED CONTENT (you have FULL ACCESS — read it and respond based on it) ━━━
+{quoted_text}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+IMPORTANT: You CAN read the content above. Do NOT say you cannot read embedded or forwarded messages.
+The content has been extracted and provided to you directly. Respond to it naturally.
+"""
+    else:
+        quoted_block = ""
+
     prompt = f"""You are Nico Jr., a helpful and friendly coworker embedded in a team's Discord channel.
 You help the team manage their Jira project, but you're also just a good coworker to chat with.
 
@@ -562,16 +748,17 @@ Your personality:
 - You never say things like "As an AI..." or "I'm just a bot" — you're Nico Jr., a coworker
 - If someone asks you to do something outside your abilities, be honest but keep it casual
 - You can remind people you can create and update Jira tickets if it seems relevant
-{epics_context}{parents_context}{assignees_context}{history_context}{server_history_context}
+- You CAN read forwarded messages and embedded content — it is extracted and provided to you directly
+{epics_context}{parents_context}{assignees_context}{history_context}{server_history_context}{quoted_block}
 {author_name} just said: \"\"\"{message_text}\"\"\"
 
 Reply naturally as Nico Jr.. Keep it short unless a detailed answer is genuinely needed."""
 
-    response = claude_client.messages.create(
+    response = await _call_claude(lambda: claude_client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=400,
         messages=[{"role": "user", "content": prompt}],
-    )
+    ))
 
     return response.content[0].text.strip()
 
@@ -603,6 +790,169 @@ def find_jira_user(name_or_email: str) -> str | None:
             return users[0]["accountId"]
 
     return None
+
+
+# ── Discord embed extraction ───────────────────────────────────────────────────
+
+def _embeds_to_text(embeds: list) -> str:
+    """
+    Convert a list of Discord Embed objects to a plain-text summary for Claude.
+    Captures all readable attributes: provider, author, title, url, description, fields, images.
+    """
+    parts = []
+    for embed in embeds:
+        lines = []
+        embed_type = getattr(embed, "type", "rich") or "rich"
+
+        # Source website (e.g. "GitHub", "Twitter")
+        provider = getattr(embed, "provider", None)
+        if provider and getattr(provider, "name", None):
+            lines.append(f"Source: {provider.name}")
+
+        # Author line (common in bot embeds and rich link previews)
+        author = getattr(embed, "author", None)
+        if author and getattr(author, "name", None):
+            lines.append(f"Author: {author.name}")
+
+        if embed.title:
+            lines.append(f"Title: {embed.title}")
+        if embed.url:
+            lines.append(f"URL: {embed.url}")
+        if embed.description:
+            lines.append(f"Description: {embed.description}")
+        for field in embed.fields:
+            lines.append(f"{field.name}: {field.value}")
+
+        # For image/gif/video embeds that carry no text, at least log the URL
+        if not lines:
+            if embed_type in ("image", "gifv"):
+                img = getattr(embed, "image", None) or getattr(embed, "thumbnail", None)
+                url = (getattr(img, "url", None) if img else None) or embed.url
+                if url:
+                    lines.append(f"[Image: {url}]")
+            elif embed_type == "video":
+                if embed.url:
+                    lines.append(f"[Video: {embed.url}]")
+
+        if lines:
+            parts.append("\n".join(lines))
+
+    return "\n\n".join(parts)
+
+
+# ── Google Drive: Detect and download publicly shared files ───────────────────
+
+_DRIVE_URL_RE = re.compile(
+    r'https?://(?:drive|docs)\.google\.com/[^\s<>"\']+',
+    re.IGNORECASE,
+)
+
+def _extract_drive_urls(text: str) -> list:
+    """
+    Find all Google Drive / Docs / Sheets / Slides share URLs in text.
+    Returns a list of dicts: {share_url, download_url, filename_hint}.
+    """
+    results = []
+    seen = set()
+    for share_url in _DRIVE_URL_RE.findall(text):
+        m = re.search(
+            r'/(?:file/d|document/d|spreadsheets/d|presentation/d)/([a-zA-Z0-9_-]+)',
+            share_url,
+        )
+        if not m:
+            m = re.search(r'[?&]id=([a-zA-Z0-9_-]+)', share_url)
+        if not m:
+            continue
+        file_id = m.group(1)
+        if file_id in seen:
+            continue
+        seen.add(file_id)
+
+        if 'docs.google.com/document' in share_url:
+            download_url   = f"https://docs.google.com/document/d/{file_id}/export?format=pdf"
+            filename_hint  = f"document_{file_id}.pdf"
+        elif 'docs.google.com/spreadsheets' in share_url:
+            download_url   = f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx"
+            filename_hint  = f"spreadsheet_{file_id}.xlsx"
+        elif 'docs.google.com/presentation' in share_url:
+            download_url   = f"https://docs.google.com/presentation/d/{file_id}/export?format=pdf"
+            filename_hint  = f"slides_{file_id}.pdf"
+        else:
+            download_url   = f"https://drive.google.com/uc?export=download&id={file_id}"
+            filename_hint  = f"drive_file_{file_id}"
+
+        results.append({"share_url": share_url, "download_url": download_url, "filename_hint": filename_hint})
+    return results
+
+
+def _download_drive_file(download_url: str, filename_hint: str) -> tuple:
+    """
+    Download a publicly shared Google Drive file.
+    Handles the large-file virus-scan confirmation page Google sometimes shows.
+    Returns (content_bytes, filename).
+    """
+    session = requests.Session()
+    resp = session.get(download_url, timeout=60, allow_redirects=True)
+    resp.raise_for_status()
+
+    # Google shows an HTML confirmation page for large files
+    if "text/html" in resp.headers.get("Content-Type", ""):
+        confirm = re.search(r'confirm=([0-9A-Za-z_]+)', resp.text)
+        if not confirm:
+            raise ValueError(
+                "Google Drive returned a confirmation page with no token — "
+                "the file may be private or require sign-in."
+            )
+        sep = "&" if "?" in download_url else "?"
+        resp = session.get(
+            f"{download_url}{sep}confirm={confirm.group(1)}",
+            timeout=60,
+            allow_redirects=True,
+        )
+        resp.raise_for_status()
+
+    # Prefer the real filename from Content-Disposition
+    cd = resp.headers.get("Content-Disposition", "")
+    fn = re.search(r"filename\*?=['\"]?(?:UTF-\d+'[^']*')?([^;\r\n\"']+)", cd)
+    filename = fn.group(1).strip() if fn else filename_hint
+
+    return resp.content, filename
+
+
+def upload_drive_attachments(ticket_key: str, drive_files: list) -> list:
+    """
+    Download each Google Drive file and upload it to the Jira ticket.
+    Returns a list of successfully uploaded filenames.
+    """
+    if not drive_files:
+        return []
+
+    upload_url = f"{JIRA_BASE_URL}/rest/api/3/issue/{ticket_key}/attachments"
+    upload_headers = {
+        "Authorization": JIRA_HEADERS["Authorization"],
+        "X-Atlassian-Token": "no-check",
+    }
+
+    uploaded = []
+    for info in drive_files:
+        try:
+            content, filename = _download_drive_file(info["download_url"], info["filename_hint"])
+            content_type = "application/octet-stream"
+            upload_resp = requests.post(
+                upload_url,
+                headers=upload_headers,
+                files={"file": (filename, content, content_type)},
+                timeout=60,
+            )
+            if upload_resp.status_code == 200:
+                uploaded.append(filename)
+                print(f"[Nico Jr.] Uploaded Drive file '{filename}' to {ticket_key}")
+            else:
+                print(f"[Nico Jr.] Warning: could not upload Drive file '{filename}' ({upload_resp.status_code})")
+        except Exception as e:
+            print(f"[Nico Jr.] Warning: failed to process Drive file {info['share_url']}: {e}")
+
+    return uploaded
 
 
 # ── Jira: Upload attachments to a ticket ──────────────────────────────────────
@@ -989,6 +1339,22 @@ def _build_single_reminder(bug: dict, now: datetime) -> str:
     )
 
 
+# ── Timer helper ──────────────────────────────────────────────────────────────
+
+async def _run_timer(channel, user, duration: float, label: str | None, confirm_msg=None) -> None:
+    """Sleep for `duration` seconds, then ping the user and freeze the countdown display."""
+    await asyncio.sleep(duration)
+    label_text = f" — **{label}**" if label else ""
+    # Edit the confirmation message to a static "0:00" so the timestamp stops counting up
+    if confirm_msg:
+        static_label = f" for **{label}**" if label else ""
+        try:
+            await confirm_msg.edit(content=f"⏱️ Timer set{static_label}! Fires **0:00**")
+        except Exception:
+            pass
+    await channel.send(f"⏰ {user.mention} Time's up{label_text}!")
+
+
 # ── Discord bot setup ──────────────────────────────────────────────────────────
 
 # message_content intent is required to read what users actually wrote
@@ -1022,7 +1388,7 @@ async def check_bug_reminders():
 
     started_at = datetime.fromisoformat(state["started_at"])
 
-    bugs = get_stale_bug_tickets()
+    bugs = await asyncio.to_thread(get_stale_bug_tickets)
 
     # Only consider tickets created after the feature was enabled
     new_bugs = [b for b in bugs if b["created_at"] > started_at]
@@ -1086,6 +1452,61 @@ async def process_message(message: discord.Message):
     if attachment_urls:
         print(f"[Nico Jr.] {len(attachment_urls)} attachment(s) found: {attachment_urls}")
 
+    # ── Step 1b: Fetch quoted/forwarded message if present ───────────────
+    quoted_text = ""
+    snapshots = getattr(message, "message_snapshots", None)
+    print(f"[Nico Jr.] msg.type={message.type} | snapshots={bool(snapshots)} | reference={bool(message.reference)} | embeds={len(message.embeds)}")
+    if snapshots:
+        # Native Discord forward — content + embeds live in message_snapshots
+        snapshot = snapshots[0]
+        print(f"[Nico Jr.] Snapshot: content={repr(snapshot.content[:80] if snapshot.content else '')} | embeds={len(snapshot.embeds)} | attachments={len(snapshot.attachments)}")
+        parts = []
+        if snapshot.content:
+            parts.append(snapshot.content)
+        embed_text = _embeds_to_text(snapshot.embeds)
+        print(f"[Nico Jr.] Snapshot embed_text: {repr(embed_text[:200])}")
+        if embed_text:
+            parts.append(f"[Embedded content]\n{embed_text}")
+        if parts:
+            quoted_text = "\n\n".join(parts)
+        else:
+            print(f"[Nico Jr.] WARNING: forwarded snapshot has no readable content")
+        for att in snapshot.attachments:
+            attachment_urls.append(att.url)
+    elif message.reference and message.reference.message_id:
+        # Discord reply — fetch the original message
+        try:
+            ref_channel = message.channel
+            if message.reference.channel_id and message.reference.channel_id != message.channel.id:
+                ref_channel = client.get_channel(message.reference.channel_id)
+            if ref_channel:
+                ref_msg = await ref_channel.fetch_message(message.reference.message_id)
+                print(f"[Nico Jr.] Replied-to msg: content={repr(ref_msg.content[:80])} | embeds={len(ref_msg.embeds)}")
+                parts = []
+                if ref_msg.content:
+                    parts.append(ref_msg.content)
+                embed_text = _embeds_to_text(ref_msg.embeds)
+                print(f"[Nico Jr.] Reply embed_text: {repr(embed_text[:200])}")
+                if embed_text:
+                    parts.append(f"[Embedded content]\n{embed_text}")
+                if parts:
+                    quoted_text = "\n\n".join(parts)
+                if ref_msg.attachments:
+                    attachment_urls.extend(a.url for a in ref_msg.attachments)
+        except Exception as e:
+            print(f"[Nico Jr.] Could not fetch referenced message: {e}")
+    print(f"[Nico Jr.] Final quoted_text: {repr(quoted_text[:200])}")
+
+    # ── Step 1c.5: Extract embeds from the message itself ────────────────
+    message_embed_text = _embeds_to_text(message.embeds) if message.embeds else ""
+
+    # ── Step 1c: Extract Google Drive links from message + quoted text ───
+    drive_files = _extract_drive_urls(message.content or "")
+    if quoted_text:
+        drive_files.extend(_extract_drive_urls(quoted_text))
+    if drive_files:
+        print(f"[Nico Jr.] {len(drive_files)} Google Drive link(s) found")
+
     print(f"[Nico Jr.] Message from {message.author.name}: {message.content}")
 
     # ── Step 2: Fetch recent channel history for context ──────────────────
@@ -1103,31 +1524,55 @@ async def process_message(message: discord.Message):
     history.reverse()  # put oldest messages first so the conversation reads naturally
     print(f"[Nico Jr.] Loaded {len(history)} past message(s) for context")
 
-    # ── Step 3: Fetch Epics, parent tickets, and assignees from Jira ──────
-    epics     = get_jira_epics()
-    parents   = get_jira_parents()
-    assignees = get_jira_assignees()
+    # ── Step 3: Fetch Epics, parents, assignees in parallel (cached 5 min) ─
+    epics, parents, assignees = await asyncio.gather(
+        asyncio.to_thread(_cached_jira, "epics",     get_jira_epics),
+        asyncio.to_thread(_cached_jira, "parents",   get_jira_parents),
+        asyncio.to_thread(_cached_jira, "assignees", get_jira_assignees),
+    )
     print(f"[Nico Jr.] Fetched {len(epics)} Epic(s), {len(parents)} parent ticket(s), and {len(assignees)} assignee(s) from Jira")
 
     # ── Step 3b: Load cross-channel server memory ──────────────────────────
-    server_history = get_cross_channel_history(limit=40, exclude_channel_id=message.channel.id)
+    server_history = await asyncio.to_thread(
+        get_cross_channel_history, 40, message.channel.id
+    )
 
     # ── Step 4: Ask Claude what the user wants ─────────────────────────────
     try:
-        analysis = analyze_message(message.content, epics, attachment_urls, history, assignees, parents, server_history)
-    except json.JSONDecodeError:
-        await message.reply(
-            "Sorry, I had trouble understanding that. Could you rephrase your request?"
-        )
+        full_content = message.content or ""
+        if message_embed_text:
+            full_content += f"\n\n[Embedded content in this message]\n{message_embed_text}"
+        analysis = await analyze_message(full_content, epics, attachment_urls, history, assignees, parents, server_history, quoted_text, len(drive_files))
+    except json.JSONDecodeError as e:
+        print(f"[Nico Jr.] JSON parse error: {e}")
+        await message.reply("Sorry, I had trouble understanding that. Could you rephrase your request?")
+        return
+    except anthropic.AuthenticationError:
+        print("[Nico Jr.] Claude auth error — check ANTHROPIC_API_KEY")
+        await message.reply("I can't reach my AI brain right now (auth issue). Tell the bot admin to check the API key.")
+        return
+    except anthropic.RateLimitError:
+        print("[Nico Jr.] Claude rate limit hit after all retries")
+        await message.reply("I'm getting a lot of requests right now — give me a moment and try again.")
+        return
+    except (anthropic.APIConnectionError, anthropic.APITimeoutError) as e:
+        print(f"[Nico Jr.] Claude connectivity error after all retries: {e}")
+        await message.reply("I'm having trouble reaching Claude right now. Try again in a moment.")
         return
     except Exception as e:
-        print(f"[Nico Jr.] Claude API error: {e}")
-        await message.reply(
-            "I'm having trouble reaching my AI brain right now. Please try again in a moment."
-        )
+        print(f"[Nico Jr.] Unexpected Claude error: {type(e).__name__}: {e}")
+        await message.reply("Something went wrong on my end. Try again in a moment.")
         return
 
     action = analysis.get("action", "ignore")
+
+    # ── Step 4b: React to the message if Claude suggested one ──────────────
+    reaction = analysis.get("reaction")
+    if reaction:
+        try:
+            await message.add_reaction(reaction)
+        except Exception as e:
+            print(f"[Nico Jr.] Could not add reaction '{reaction}': {e}")
 
     # ── Step 5: Silently ignore if not relevant ────────────────────────────
     if action == "ignore":
@@ -1137,11 +1582,37 @@ async def process_message(message: discord.Message):
     if action in ("chat", "none"):
         print("[Nico Jr.] Responding conversationally.")
         try:
-            reply = chat_with_nico_jr(message.content, message.author.display_name, history, epics, assignees, parents, server_history)
+            reply = await chat_with_nico_jr(full_content, message.author.display_name, history, epics, assignees, parents, server_history, quoted_text)
             await message.reply(reply)
         except Exception as e:
             print(f"[Nico Jr.] Chat error: {e}")
             await message.reply("Sorry, my brain froze for a second. What were you saying?")
+        return
+
+    # ── Step 5c: Set a timer ───────────────────────────────────────────────
+    if action == "timer":
+        duration = analysis.get("duration_seconds", 0)
+        label    = analysis.get("label") or None
+
+        if not duration or duration <= 0:
+            await message.reply(
+                "I couldn't figure out how long to set the timer for. "
+                "Try something like 'set a timer for 5 minutes'."
+            )
+            return
+
+        if duration > 86400:
+            await message.reply("I can only set timers up to 24 hours. Give me a shorter duration!")
+            return
+
+        # Discord live countdown timestamp — renders and ticks in every client
+        fire_ts = int(datetime.now(timezone.utc).timestamp()) + int(duration)
+        discord_ts = f"<t:{fire_ts}:R>"  # e.g. "in 5 minutes", counts down live
+
+        label_text = f" for **{label}**" if label else ""
+        confirm_msg = await message.reply(f"⏱️ Timer set{label_text}! Fires {discord_ts}")
+
+        asyncio.create_task(_run_timer(message.channel, message.author, duration, label, confirm_msg))
         return
 
     # ── Step 6: Route to create or update ─────────────────────────────────
@@ -1149,14 +1620,17 @@ async def process_message(message: discord.Message):
         status_msg = await message.reply("On it! Creating your Jira ticket...")
 
         try:
-            ticket = create_jira_ticket(
-                title=analysis["title"],
-                description=analysis["description"],
-                priority=analysis.get("priority", "Medium"),
-                assignee_name=analysis.get("assignee"),
-                issue_type=analysis.get("issue_type", "Task"),
-                epic_key=analysis.get("epic_key"),
-                parent_key=analysis.get("parent_key"),
+            prefix = build_title_prefix(analysis.get("epic_key"), analysis.get("assignee"), epics)
+            final_title = prefix + analysis["title"]
+            ticket = await asyncio.to_thread(
+                create_jira_ticket,
+                final_title,
+                analysis["description"],
+                analysis.get("priority", "Medium"),
+                analysis.get("assignee"),
+                analysis.get("issue_type", "Task"),
+                analysis.get("epic_key"),
+                analysis.get("parent_key"),
             )
         except Exception as e:
             print(f"[Nico Jr.] Jira error: {e}")
@@ -1193,16 +1667,19 @@ async def process_message(message: discord.Message):
 
         confirmation = (
             f"Ticket created!\n\n"
-            f"> **[{ticket['key']}]({ticket['url']})** — {analysis['title']}\n"
+            f"> **[{ticket['key']}]({ticket['url']})** — {final_title}\n"
             + "\n".join(meta_lines)
             + f"\n> {ticket['url']}"
         )
 
         # Upload attachments to the ticket and embed images in the description
-        uploaded = upload_jira_attachments(ticket["key"], attachment_urls)
+        uploaded = await asyncio.to_thread(upload_jira_attachments, ticket["key"], attachment_urls)
         if uploaded:
-            embed_images_in_description(ticket["key"], attachment_urls)
+            await asyncio.to_thread(embed_images_in_description, ticket["key"], attachment_urls)
             meta_lines.append(f"> **Attachments:** {len(uploaded)} file(s) uploaded & embedded in description")
+        drive_uploaded = await asyncio.to_thread(upload_drive_attachments, ticket["key"], drive_files)
+        if drive_uploaded:
+            meta_lines.append(f"> **Drive files:** {len(drive_uploaded)} file(s) uploaded from Google Drive")
 
         await status_msg.edit(content=confirmation)
         print(f"[Nico Jr.] Created ticket {ticket['key']}")
@@ -1211,17 +1688,18 @@ async def process_message(message: discord.Message):
         ticket_key = analysis.get("ticket_key", "").upper()
         fields     = analysis.get("fields", {})
 
-        if not ticket_key:
+        # Hard guard: only proceed if the ticket key is literally in the message.
+        # This prevents Claude from guessing a key from conversation history.
+        if not ticket_key or not re.search(r'\b' + re.escape(ticket_key) + r'\b', message.content, re.IGNORECASE):
             await message.reply(
-                "I couldn't find a ticket number in your message. "
-                "Please include the ticket key, e.g. `PROJ-123`."
+                "Which ticket did you mean? Include the ticket key (e.g. `TA-6794`) and I'll update it."
             )
             return
 
         status_msg = await message.reply(f"On it! Updating **{ticket_key}**...")
 
         try:
-            ticket = update_jira_ticket(ticket_key, fields)
+            ticket = await asyncio.to_thread(update_jira_ticket, ticket_key, fields)
         except Exception as e:
             print(f"[Nico Jr.] Jira update error: {e}")
             await status_msg.edit(
@@ -1258,10 +1736,13 @@ async def process_message(message: discord.Message):
             ek = fields["epic_key"]
             epic_label = f"{ek} — {epic_lookup[ek]}" if ek in epic_lookup else ek
             changed.append(f"> **Epic** → {epic_label}")
-        uploaded = upload_jira_attachments(ticket_key, attachment_urls)
+        uploaded = await asyncio.to_thread(upload_jira_attachments, ticket_key, attachment_urls)
         if uploaded:
-            embed_images_in_description(ticket_key, attachment_urls)
+            await asyncio.to_thread(embed_images_in_description, ticket_key, attachment_urls)
             changed.append(f"> **Attachments** → {len(uploaded)} file(s) uploaded & embedded in description")
+        drive_uploaded = await asyncio.to_thread(upload_drive_attachments, ticket_key, drive_files)
+        if drive_uploaded:
+            changed.append(f"> **Drive files** → {len(drive_uploaded)} file(s) uploaded from Google Drive")
 
         changes_text = "\n".join(changed) if changed else "> (no recognisable fields were changed)"
 
@@ -1284,7 +1765,11 @@ def _should_process(message: discord.Message) -> bool:
         return False
     if message.guild is None:  # ignore DMs
         return False
-    if not message.content.strip() and not message.attachments:
+    has_content = bool(message.content.strip())
+    has_attachments = bool(message.attachments)
+    has_forward = bool(getattr(message, "message_snapshots", None))
+    has_embeds = bool(message.embeds)
+    if not has_content and not has_attachments and not has_forward and not has_embeds:
         return False
     if message.author.bot:  # ignore other bots
         return False
@@ -1307,6 +1792,16 @@ def _remember(message: discord.Message) -> None:
 async def on_message(message: discord.Message):
     """Fired every time a new message is sent."""
     _remember(message)
+
+    if message.content.strip().lower() == "!restart" and not message.author.bot:
+        if message.author.guild_permissions.administrator:
+            await message.reply("Restarting... brb!")
+            await client.close()
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        else:
+            await message.reply("Sorry, only server admins can restart me.")
+        return
+
     if _should_process(message):
         await process_message(message)
 
